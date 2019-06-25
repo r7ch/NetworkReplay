@@ -1,0 +1,239 @@
+#!/usr/bin/python3
+import logging
+logging.getLogger("kamene.runtime").setLevel(logging.ERROR)
+from kamene.all import rdpcap, sendp, sniff, ETH_P_ALL
+from kamene.config import conf
+import argparse
+import time
+import random
+
+# variables
+pack_start_time = None
+packet_number = 0
+ready_send = []
+config_dict = {}
+sock = None
+
+argument = argparse.ArgumentParser('Replay')
+argument.add_argument('-s', action="store_true",default=False, help='send packets')
+argument.add_argument('confFile', help="The config file")
+args = argument.parse_args()
+
+with open(args.confFile, 'r') as f:
+    config_data = f.readlines()
+
+# the information from the config file
+config_dict['tcpdump log file'] = config_data[0].strip()
+config_dict['victim ip'] = config_data[1].strip()
+config_dict['victim mac'] = config_data[2].strip()
+config_dict['victim port'] = int(config_data[3])
+config_dict['attacker ip'] = config_data[4].strip()
+config_dict['attacker mac'] = config_data[5].strip()
+config_dict['attacker port'] = int(config_data[6])
+config_dict['replay victim ip'] = config_data[7].strip()
+config_dict['replay victim mac'] = config_data[8].strip()
+config_dict['replay victim port'] = int(config_data[9])
+config_dict['replay attacker ip'] = config_data[10].strip()
+config_dict['replay attacker mac'] = config_data[11].strip()
+config_dict['replay attacker port'] = int(config_data[12])
+config_dict['interface'] = config_data[13].strip()
+config_dict['timing'] = config_data[14].strip()
+
+if args.s:
+    sock = conf.L2listen(type=ETH_P_ALL,
+                        iface=config_dict['interface'],
+                        filter="tcp and dst host %s and src host %s" % \
+                        (config_dict['replay attacker ip'], config_dict['replay victim ip']))
+
+
+def update_pack(p):
+    global ready_send
+
+    name_prt1 = 'replay attacker ' if p.src == config_dict['attacker mac'] else 'replay victim '
+    name_prt2 = 'replay attacker ' if p.src != config_dict['attacker mac'] else 'replay victim '
+
+    # change the destination and source
+    p.src = config_dict[name_prt1 + 'mac']
+    p.dst = config_dict[name_prt2 + 'mac']
+
+    p.payload.src = config_dict[name_prt1 + 'ip']
+    p.payload.dst = config_dict[name_prt2 + 'ip']
+
+    p.payload.payload.dport = config_dict[name_prt2 + 'port']
+    p.payload.payload.sport = config_dict[name_prt1 + 'port']
+
+    if args.s and name_prt1 == 'replay attacker ':
+        del p.payload.chksum
+        del p.payload.payload.chksum
+        ready_send += [p]
+
+def print_pack(p, p_num, p_cur_time):
+    global ready_send
+
+    arp_dct =  {1: "Arp Request", 2:"Arp Reply", 3:"Reverse Arp Request", 4:"Reverse Arp Reply"}
+    icmp_dct = {0: 'Echo Reply', 3: 'Destination Unreachable', 4: 'Source Quench', 5: 'Route Redirection',
+                6: 'Alternate Host Address', 8: 'Echo', 9: 'Route Advertisement', 10: 'Route Solicitation',
+                11: 'Time Exceeded', 12: 'Bad IP Header', 13: 'Time Stamp Request', 14: 'Time Stamp Reply',
+                15: 'Information Request', 16: 'Information Reply', 17: 'Address Mask Request',
+                18: 'Address Mask Reply', 30: 'Traceroute', 31: 'Data Conversion Error',
+                32: 'Mobile Host Redirection', 33: 'IPV6 Where are you?', 34: 'IPV6 I am here.',
+                35: 'Mobile Registration Request', 36: 'Mobile Registration Reply', 37: 'Domain Name Request',
+                38: 'Domain Name Reply', 39: 'Skip', 40: 'Photuris'}
+
+    print(p_num)
+    print("{:0.6f}".format(p_cur_time))
+
+    # wirelen is the size of the packet that was captured
+    # not what we actually grabbed.
+    try:
+        print("Captured Packet Length = {}".format(p.wirelen))
+    except AttributeError as e:
+        pass
+    print("Actual Packet Length = {}".format(len(p)))
+
+    print("Ethernet Header")
+
+    print("    eth_src = {}".format(p.src))
+    print("    eth_dst = {}".format(p.dst))
+
+    if p.payload.name == 'ARP':
+        print("        {}".format(arp_dct[p.payload.op]))
+
+    elif p.payload.name == 'IP':
+        print("    IP")
+        print("        ip len = {}".format(p.payload.len))
+        print("        ip src = {}".format(p.payload.src))
+        print("        ip dst = {}".format(p.payload.dst))
+
+        if p.payload.payload.name == 'UDP':
+            print("        UDP")
+            print("            Src Port = {}".format(p.payload.payload.sport))
+            print("            Dst Port = {}".format(p.payload.payload.dport))
+
+        elif p.payload.payload.name == 'TCP':
+            print("        TCP")
+            print("            Src Port = {}".format(p.payload.payload.sport))
+            print("            Dst Port = {}".format(p.payload.payload.dport))
+            print("            Seq = {}".format(p.payload.payload.seq))
+            print("            Ack = {}".format(p.payload.payload.ack))
+
+        elif p.payload.payload.name == 'ICMP':
+            print("        ICMP")
+            print("            {}".format(icmp_dct[p.payload.payload.type]))
+        else:
+            print("        Other")
+    else:
+        print("    Other")
+
+    print()
+
+
+# Print header
+def header_bs():
+    with open(config_dict['tcpdump log file'], 'rb') as f:
+        h_data = f.read(24)
+
+        print("PCAP_MAGIC")
+        print("Version major number = {}".format(int.from_bytes(h_data[4:6], byteorder='little')))
+        print("Version minor number = {}".format(int.from_bytes(h_data[6:8], byteorder='little')))
+        print("GMT to local correction = {}".format(int.from_bytes(h_data[8:12], byteorder='little')))
+        print("Timestamp accuracy = {}".format(int.from_bytes(h_data[12:16], byteorder='little')))
+        print("Snaplen = {}".format(int.from_bytes(h_data[16:20], byteorder='little')))
+        print("Linktype = {}".format(int.from_bytes(h_data[20:24], byteorder='little')))
+        print()
+
+
+# attack func
+def run_atk(packs):
+
+    total_size, nxt_sz = 0, 0
+    pack_prev = None
+    pack_nr = 0
+    attack_prev = False
+    prev_atk_ack = -1
+    st = time.time()
+
+    for i, pk in enumerate(packs):
+        #  skipping packets
+        if prev_atk_ack > -1 and pk.payload.payload.ack - prev_atk_ack < total_size and pk.payload.payload.flags == 0x10:
+            continue
+
+        prev_fin_syn_ack = pack_prev is not None and \
+                (pack_prev.payload.payload.flags == 0x12 or
+                 pack_prev.payload.payload.flags == 0x11)
+
+        prev_has_syn_fin = pack_prev is not None and (pack_prev.payload.payload.flags | 0x01 == pack_prev.payload.payload.flags or
+                         pack_prev.payload.payload.flags | 0x02 == pack_prev.payload.payload.flags)
+
+
+        # syn ack logic
+        prev_atk_ack = pk.payload.payload.ack
+        if pack_prev is None:
+            pk.payload.payload.seq = 0
+            pk.payload.payload.ack = 0
+        elif prev_fin_syn_ack:
+            pk.payload.payload.seq = pack_prev.payload.payload.ack
+            pk.payload.payload.ack = pack_prev.payload.payload.seq + 1
+        elif attack_prev:
+            pk.payload.payload.seq = pack_prev.payload.payload.seq + nxt_sz + (1 if prev_has_syn_fin else 0)
+            pk.payload.payload.ack = pack_prev.payload.payload.ack
+        else:
+            pk.payload.payload.seq = pack_prev.payload.payload.ack
+            pk.payload.payload.ack = pack_prev.payload.payload.seq + nxt_sz + (1 if prev_has_syn_fin else 0)
+
+        # send packets
+        sendp(pk, iface=config_dict['interface'])
+        print_pack(pk, pack_nr, time.time() - st)
+        pack_nr += 1
+        print("\tPacket Sent\n")
+
+        # syn ack or fin ack
+        if prev_fin_syn_ack:
+            if pack_prev.payload.payload.flags != 0x10:
+                total_size = len(pack_prev.payload.payload.payload)
+            else:
+                total_size = 0
+            pack_prev = pk
+            attack_prev = True
+            continue
+
+        # get responses
+        res_p = sniff(iface=config_dict['interface'], opened_socket=sock, timeout=0.075 if config_dict['timing'] != 'delay' else 0.5)
+        if res_p.res is None or len(res_p.res) == 0:
+            continue
+
+        # go through the packets
+        total_size = 0
+        for pack in res_p.res:
+            pack.time = time.time()
+            print_pack(pack, pack_nr, time.time() - st)
+            pack_prev = pack
+            pack_nr += 1
+            total_size += len(pack.payload.payload.payload)
+            nxt_sz = len(pack.payload.payload.payload)
+            print("\tPacket Received\n")
+
+        attack_prev = False
+
+    
+header_bs()
+packet = rdpcap(config_dict['tcpdump log file'])
+
+if not args.s:
+    for p in packet:
+        if pack_start_time is None:
+            pack_start_time = p.time
+
+        cur_time = p.time - pack_start_time
+        print_pack(p, packet_number, cur_time)
+        packet_number += 1
+
+else:
+    for p in packet:
+        try:
+            # if source is the original attacker find in config source and update info
+            update_pack(p)
+        except AttributeError as e:
+            continue
+    run_atk(ready_send)
+    
